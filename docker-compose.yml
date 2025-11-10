@@ -1,13 +1,72 @@
 version: "3.8"
 services:
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: djamo
+      POSTGRES_PASSWORD: djamo_dev
+      POSTGRES_DB: transactions
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U djamo"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   thirdparty:
     build: ./thirdpartymock
     ports:
       - "3000:3000"
 
+  your_api:
+    build: ./your_api
+    command: npm run start:dev
+    ports:
+      - "3001:3000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      THIRDPARTY_URL: "http://thirdparty:3000"
+      CLIENT_URL: "http://client:3100"
+      YOUR_API_URL: "http://your_api:3000"
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: djamo
+      DB_PASSWORD: djamo_dev
+      DB_DATABASE: transactions
+    volumes:
+      - ./your_api/src:/app/src
+      - ./your_api/test:/app/test
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      thirdparty:
+        condition: service_started
+
   client:
     build: ./client
     environment:
-      YOUR_API: "http://thirdparty:3000" # replace with your new API
+      YOUR_API: "http://your_api:3000"
     ports:
       - "3100:3100"
+    depends_on:
+      - your_api
+
+volumes:
+  postgres-data:
