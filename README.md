@@ -1,59 +1,129 @@
-# Djamo's take-home test for API Software Engineer candidates
+# Resilient Payment API — NestJS
 
-The goal of this test is to be a _work sample_. Instead of asking you to solve a quizz, implement fizzbuzz or a binary tree search, we would like you to work on something similar to our work. A very common task at Djamo is to integrate with third parties, and while we try to keep our services highly available, fast and reliable, unfortunately we often face issues with our partners.
+API de transactions de paiement conçue pour rester **rapide et fiable côté mobile**, même lorsque le partenaire de paiement est lent, instable ou incomplet dans ses réponses.
 
-However, it is Djamo's mission to bring the best experience to our customers. That means it is our duty to handle cleanly all of these errors, so that from a user perspective it looks like everything went fine. This test will give you a glimpse of the issues we can face with 3rd parties.
+> Projet réalisé dans le cadre d'un exercice technique fintech : intégrer un service de paiement tiers peu fiable sans dégrader l'expérience de l'utilisateur mobile.
 
-## Context
+## Le problème
+
+Une application mobile demande un transfert d'argent à l'API, qui le transmet à un partenaire de paiement. Ce partenaire pose plusieurs difficultés :
+
+- il répond lentement (jusqu'à 10 s) et ne donne pas toujours le résultat final tout de suite ;
+- il renvoie parfois une erreur **504**, alors que la transaction peut quand même aboutir plus tard (jusqu'à 120 s) ;
+- il est censé notifier le résultat par **webhook**, mais ne le fait pas toujours ;
+- son API de statut existe, mais il ne faut pas l'interroger trop souvent.
+
+Côté mobile, il faut répondre **le plus vite possible**, communiquer le résultat final **dès qu'il est connu** et ne traiter **qu'une seule fois** une requête que le mobile renverrait à cause d'un réseau instable.
+
+## La solution
+
+| Besoin | Réponse apportée |
+|---|---|
+| Réponse rapide au mobile | La transaction est enregistrée puis traitée en asynchrone. L'API répond immédiatement `pending`. |
+| Requêtes en double | **Idempotence** grâce à l'identifiant fourni par le client, protégé par un index unique PostgreSQL. Une requête répétée renvoie le statut existant. |
+| Partenaire lent ou en timeout | Files **BullMQ / Redis** avec retries et backoff exponentiel. Un timeout n'est pas considéré comme un échec : une vérification de statut est planifiée. |
+| Webhook manquant | Une vérification de statut différée prend le relais, seulement si le webhook n'est pas arrivé. |
+| Webhook et vérification qui se croisent | Les indicateurs `webhookReceived` et `clientNotified` évitent les appels inutiles et les doubles notifications. |
+| Notification du client en échec | File dédiée avec retries. |
+
+### Architecture
 
 ```mermaid
-graph TD
-    Mobile -->|1. Send money| YourAPI(Your API)
-    YourAPI -->|2. Trigger transaction| 3P(3rd Party)
-    YourAPI -->|3. Send result| Mobile
+sequenceDiagram
+    participant Mobile
+    participant API as API NestJS
+    participant DB as PostgreSQL
+    participant Q as BullMQ / Redis
+    participant P as Partenaire de paiement
+
+    Mobile->>API: POST /transaction {id}
+    API->>DB: Recherche par id client (idempotence)
+    API->>DB: Création (PENDING)
+    API->>Q: Job transaction-processing
+    API-->>Mobile: {id, status: pending}
+
+    Q->>P: POST /transaction {id, webhookUrl}
+    alt Webhook reçu
+        P->>API: POST /webhook {id, status}
+        API->>DB: Statut final + webhookReceived
+    else Pas de webhook / timeout
+        Q->>P: GET /transaction/:id (différé, avec backoff)
+        API->>DB: Statut final
+    end
+    Q->>Mobile: PUT /transaction {id, status} (une seule fois)
 ```
 
-You're tasked to developed an API. A mobile application will call your API, and in turn you'll have to call an external service. If the transfer worked, you'll have to notify the mobile application of the success, otherwise, of the failure.
+Trois files indépendantes, chacune avec sa propre politique de retry :
 
-### 3rd party's constraints
+1. **`transaction-processing`** : appel au partenaire, puis planification d'une vérification de statut si le résultat n'est pas encore final.
+2. **`status-check`** : interroge le partenaire uniquement si aucun webhook n'a été reçu et si la transaction n'est pas déjà finalisée.
+3. **`client-notification`** : informe le mobile du résultat final, une seule fois.
 
-As mentionned before, our partners have a number issues, and this one has its share:
+### Cycle de vie d'une transaction
 
-- it does not return immediatly if it worked, or not
-- it takes a long time to answer (up to 10s)
-- it is supposed to call you back through a webhook -- but sometimes it doesn't
-- it has a status check API -- but they explicitely said they could block our services if we request it too often
-- it will time out (HTTP 504) from time to time, but sometimes the request actually will go through after a longer time (up to 120s).
+`PENDING` → `PROCESSING` → `COMPLETED` | `DECLINED` | `FAILED`
 
-### Your constraints
+> Le schéma de la base de données et la gestion détaillée des cas limites sont décrits dans [`your_api/README.md`](your_api/README.md).
 
-Your API is consumed by a mobile application, and the experience needs to feel pleasant for the user. So you need to:
+## Stack technique
 
-- return a response as fast as possible
-- return the success / failure of the transaction as quickly as possible
+NestJS · TypeScript · PostgreSQL · TypeORM · BullMQ · Redis · Axios · Docker Compose
 
-Due to poor network connectivity, sometimes the mobile application will re-try to send the same request twice. You must detect it and only handle the request once.
+## Lancer le projet
+
+Prérequis : Docker et Docker Compose.
+
+```bash
+docker-compose up --build
+```
+
+| Service | URL |
+|---|---|
+| API NestJS | http://localhost:3001 |
+| Mock du partenaire de paiement | http://localhost:3000 |
+| Mock du client mobile | http://localhost:3100 |
+| PostgreSQL | localhost:5432 |
+| Redis | localhost:6379 |
+
+Déclencher une transaction via le client simulé :
+
+```bash
+curl -X POST http://localhost:3100/transaction -H "Content-Type: application/json"
+```
+
+Suivre le cycle de vie dans les logs :
+
+```bash
+docker-compose logs -f your_api client
+```
+
+## Endpoints
+
+| Méthode | Route | Rôle |
+|---|---|---|
+| `POST` | `/transaction` | Crée une transaction (`{ "id": "<uuid>" }`) ou renvoie le statut d'une transaction existante |
+| `POST` | `/webhook` | Reçoit le résultat envoyé par le partenaire (`{ "id", "status" }`) |
 
 ## Structure
 
-You can start the project easily by running `docker-compose up -d`. This will start a mock for the 3rd party service and for the client application. We encourage to take a look at the different READMEs to understand the global picture.
-
 ```
 .
-├── docker-compose.yml
-├── README.md
-├── client
-│   └── README.md
-├── thirdpartymock
-│   └── README.md
-└── your_api
-    └── README.md
+├── your_api/        # API NestJS (contrôleurs, services, processors BullMQ, entité Transaction)
+├── thirdpartymock/  # Simulation du partenaire de paiement instable
+├── client/          # Simulation de l'application mobile
+└── docker-compose.yml
 ```
 
-If you want to perform some tests after your docker-compose is up, you can run the following cURL:
+## Pistes d'amélioration
 
-```
-curl -H 'Content-Type: application/json' -X POST localhost:3100/transaction
-```
+- Tests unitaires et d'intégration sur l'idempotence et les processors.
+- Validation des entrées avec `class-validator`.
+- Gestion explicite des requêtes concurrentes portant le même identifiant.
+- Endpoint `GET /transaction/:id` pour que le mobile consulte le statut lui-même.
+- Logs structurés avec identifiant de corrélation, et tableau de bord des files.
+- Migrations TypeORM à la place de `synchronize` pour la production.
 
-This will ask the client application to trigger a transaction creation. Which in turn will call your API.
+## Auteur
+
+**Mariko Oudou** — Développeur Full Stack (Flutter / NestJS / paiements Mobile Money)
+[LinkedIn](https://www.linkedin.com/in/mariko-oudou) · [GitHub](https://github.com/MarikoOudou)
